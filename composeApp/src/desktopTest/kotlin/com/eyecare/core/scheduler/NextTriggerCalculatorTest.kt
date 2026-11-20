@@ -1,100 +1,82 @@
 package com.eyecare.core.scheduler
 
-import com.eyecare.domain.model.WeeklySchedule
 import com.eyecare.testing.BUDAPEST
+import com.eyecare.testing.band
 import com.eyecare.testing.local
 import java.time.DayOfWeek
-import java.time.LocalTime
+import java.time.LocalDate
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
-import kotlin.test.assertTrue
 
 class NextTriggerCalculatorTest {
-
-    private fun day(
-        dow: DayOfWeek,
-        start: String = "09:00",
-        end: String = "17:00",
-        interval: Int = 20,
-        enabled: Boolean = true,
-        id: Long = dow.value.toLong(),
-    ) = WeeklySchedule(id, dow, LocalTime.parse(start), LocalTime.parse(end), interval, enabled)
 
     // 2026-11-23 is a Monday.
 
     @Test
-    fun `next slot later the same day`() {
-        val next = NextTriggerCalculator.next(listOf(day(DayOfWeek.MONDAY)), local("2026-11-23T10:05"), BUDAPEST)
-        assertEquals(local("2026-11-23T10:20"), next?.at)
-        assertEquals(1L, next?.scheduleId)
+    fun `slots are start plus k times interval within the band`() {
+        val slots = NextTriggerCalculator.slotsBetween(listOf(band()), local("2026-11-23T00:00"), local("2026-11-23T23:59"), BUDAPEST)
+        assertEquals(listOf("09:00", "10:30", "12:00", "13:30", "15:00", "16:30"), slots.map { it.at.atZone(BUDAPEST).toLocalTime().toString() })
     }
 
     @Test
-    fun `slot exactly now is not returned, the following one is`() {
-        val next = NextTriggerCalculator.next(listOf(day(DayOfWeek.MONDAY)), local("2026-11-23T10:20"), BUDAPEST)
-        assertEquals(local("2026-11-23T10:40"), next?.at)
+    fun `next slot later the same day, exclusive of now`() {
+        assertEquals(local("2026-11-23T10:30"), NextTriggerCalculator.next(listOf(band()), local("2026-11-23T09:00"), BUDAPEST)?.at)
     }
 
     @Test
-    fun `end time is exclusive and rolls over to next active day`() {
-        val routine = listOf(day(DayOfWeek.MONDAY), day(DayOfWeek.WEDNESDAY))
-        val next = NextTriggerCalculator.next(routine, local("2026-11-23T16:40"), BUDAPEST)
-        assertEquals(local("2026-11-25T09:00"), next?.at)
+    fun `skips handled occurrences`() {
+        val handled = setOf(1L to local("2026-11-23T10:30"))
+        assertEquals(local("2026-11-23T12:00"), NextTriggerCalculator.next(listOf(band()), local("2026-11-23T10:00"), BUDAPEST, handled)?.at)
     }
 
     @Test
-    fun `disabled days are ignored`() {
-        val routine = listOf(day(DayOfWeek.MONDAY, enabled = false), day(DayOfWeek.FRIDAY))
-        val next = NextTriggerCalculator.next(routine, local("2026-11-23T08:00"), BUDAPEST)
-        assertEquals(local("2026-11-27T09:00"), next?.at)
+    fun `rolls over to the next active day, weekends off`() {
+        assertEquals(local("2026-11-30T09:00"), NextTriggerCalculator.next(listOf(band()), local("2026-11-27T17:00"), BUDAPEST)?.at)
     }
 
     @Test
-    fun `same weekday next week when today's window is over`() {
-        val next = NextTriggerCalculator.next(listOf(day(DayOfWeek.MONDAY)), local("2026-11-23T18:00"), BUDAPEST)
-        assertEquals(local("2026-11-30T09:00"), next?.at)
-    }
-
-    @Test
-    fun `nothing active returns null`() {
+    fun `inactive or empty routine yields nothing`() {
         assertNull(NextTriggerCalculator.next(emptyList(), local("2026-11-23T08:00"), BUDAPEST))
-        assertNull(NextTriggerCalculator.next(listOf(day(DayOfWeek.MONDAY, enabled = false)), local("2026-11-23T08:00"), BUDAPEST))
-        assertNull(NextTriggerCalculator.next(listOf(day(DayOfWeek.MONDAY, start = "10:00", end = "09:00")), local("2026-11-23T08:00"), BUDAPEST))
+        assertNull(NextTriggerCalculator.next(listOf(band(active = false)), local("2026-11-23T08:00"), BUDAPEST))
+        assertNull(NextTriggerCalculator.next(listOf(band(days = emptySet())), local("2026-11-23T08:00"), BUDAPEST))
     }
 
     @Test
-    fun `DST spring forward gap shifts slot and does not duplicate`() {
+    fun `band crossing midnight continues on the next day`() {
+        val night = band(days = setOf(DayOfWeek.MONDAY), start = "22:00", end = "02:00", interval = 120)
+        val slots = NextTriggerCalculator.slotsBetween(listOf(night), local("2026-11-23T00:00"), local("2026-11-24T06:00"), BUDAPEST)
+        assertEquals(listOf(local("2026-11-23T22:00"), local("2026-11-24T00:00")), slots.map { it.at })
+        val inst = NextTriggerCalculator.currentOrNextInstance(listOf(night), local("2026-11-24T01:00"), BUDAPEST)!!
+        assertEquals(local("2026-11-24T02:00"), inst.end)
+    }
+
+    @Test
+    fun `DST spring forward keeps wall-clock times`() {
         // 2026-03-29 (Sunday): Budapest clocks jump 02:00 -> 03:00.
-        val routine = listOf(day(DayOfWeek.SUNDAY, start = "01:30", end = "04:00", interval = 30))
-        val slots = NextTriggerCalculator.slotsBetween(routine, local("2026-03-29T00:00"), local("2026-03-29T05:00"), BUDAPEST)
-        val wall = slots.map { it.at.atZone(BUDAPEST).toLocalTime().toString() }
-        // 02:00 and 02:30 don't exist -> become 03:00 and 03:30, which are already slots.
-        assertEquals(listOf("01:30", "03:00", "03:30"), wall)
+        val b = band(days = setOf(DayOfWeek.SUNDAY), start = "01:00", end = "05:00", interval = 60)
+        val slots = NextTriggerCalculator.slotsBetween(listOf(b), local("2026-03-29T00:00"), local("2026-03-29T06:00"), BUDAPEST)
+        // 02:00 does not exist and maps to 03:00, which is already a slot.
+        assertEquals(listOf("01:00", "03:00", "04:00"), slots.map { it.at.atZone(BUDAPEST).toLocalTime().toString() })
     }
 
     @Test
-    fun `DST fall back produces a single slot for the repeated hour`() {
-        // 2026-10-25 (Sunday): Budapest clocks go 03:00 -> 02:00.
-        val routine = listOf(day(DayOfWeek.SUNDAY, start = "02:00", end = "03:00", interval = 30))
-        val slots = NextTriggerCalculator.slotsBetween(routine, local("2026-10-25T00:00"), local("2026-10-25T05:00"), BUDAPEST)
-        assertEquals(2, slots.size)
-    }
-
-    @Test
-    fun `interval keeps wall-clock times across a DST change`() {
-        val routine = listOf(day(DayOfWeek.MONDAY, start = "09:00", end = "10:00", interval = 60))
-        val before = NextTriggerCalculator.next(routine, local("2026-03-23T08:00"), BUDAPEST)!!
-        val after = NextTriggerCalculator.next(routine, local("2026-03-30T08:00"), BUDAPEST)!!
+    fun `same wall-clock time before and after DST`() {
+        val b = band(days = setOf(DayOfWeek.MONDAY), start = "09:00", end = "10:00", interval = 60)
+        val before = NextTriggerCalculator.next(listOf(b), local("2026-03-23T08:00"), BUDAPEST)!!
+        val after = NextTriggerCalculator.next(listOf(b), local("2026-03-30T08:00"), BUDAPEST)!!
         assertEquals("09:00", before.at.atZone(BUDAPEST).toLocalTime().toString())
         assertEquals("09:00", after.at.atZone(BUDAPEST).toLocalTime().toString())
     }
 
     @Test
-    fun `latestDue returns only the most recent slot in the window`() {
-        val routine = listOf(day(DayOfWeek.MONDAY))
-        val due = NextTriggerCalculator.latestDue(routine, local("2026-11-23T08:00"), local("2026-11-23T11:05"), BUDAPEST)
-        assertEquals(local("2026-11-23T11:00"), due?.at)
-        assertTrue(NextTriggerCalculator.latestDue(routine, local("2026-11-23T11:01"), local("2026-11-23T11:05"), BUDAPEST) == null)
+    fun `current or next instance`() {
+        val bands = listOf(band())
+        val during = NextTriggerCalculator.currentOrNextInstance(bands, local("2026-11-23T11:00"), BUDAPEST)!!
+        assertEquals(local("2026-11-23T09:00"), during.start)
+        assertEquals(6, during.slots.size)
+        val evening = NextTriggerCalculator.currentOrNextInstance(bands, local("2026-11-23T18:00"), BUDAPEST)!!
+        assertEquals(local("2026-11-24T09:00"), evening.start)
+        assertEquals(LocalDate.of(2026, 11, 24), evening.start.atZone(BUDAPEST).toLocalDate())
     }
 }

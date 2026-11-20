@@ -8,16 +8,15 @@ import com.eyecare.domain.repository.ExerciseRepository
 import com.eyecare.domain.usecase.CompleteExerciseUseCase
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * Step-by-step exercise runner (section 3.4): shows the current instruction, counts down its
- * duration and advances. The scope is owned by the exercise screen, so leaving the screen stops it.
+ * Step-by-step exercise runner (section 3.4). Steps advance automatically in real time; the only
+ * user action is abort. The scope is owned by the exercise window, so closing it stops the timer.
  */
 class ExerciseSessionViewModel(
     private val scope: CoroutineScope,
@@ -28,25 +27,20 @@ class ExerciseSessionViewModel(
 ) {
     sealed interface State {
         data object Loading : State
-        data class Running(val exercise: Exercise, val stepIndex: Int, val remainingSeconds: Int) : State {
+        data class Running(val exercise: Exercise, val stepIndex: Int, val remainingMillis: Long) : State {
             val step get() = exercise.steps[stepIndex]
             val stepCount get() = exercise.steps.size
-            /** Overall progress 0..1 across all steps. */
-            val progress: Float
-                get() {
-                    val done = exercise.steps.take(stepIndex).sumOf { it.durationSeconds } + (step.durationSeconds - remainingSeconds)
-                    return if (exercise.totalSeconds == 0) 1f else done.toFloat() / exercise.totalSeconds
-                }
+            val remainingSeconds: Int get() = ((remainingMillis + 999) / 1000).toInt()
+            /** Ring fill for the current step, 1 → 0. */
+            val stepFraction: Float get() = remainingMillis.toFloat() / (step.durationSeconds * 1000L)
         }
         data class Finished(val feedback: Feedback) : State
-        data object Cancelled : State
+        data object Aborted : State
         data object Unavailable : State
     }
 
     private val _state = MutableStateFlow<State>(State.Loading)
     val state: StateFlow<State> = _state.asStateFlow()
-
-    private val skipRequests = Channel<Unit>(Channel.CONFLATED)
     private var job: Job? = null
 
     fun start() {
@@ -59,31 +53,27 @@ class ExerciseSessionViewModel(
             }
             analytics.track(AnalyticsEvent.ExerciseStarted(fromReminder = reminderId != null))
             for (index in exercise.steps.indices) {
-                var remaining = exercise.steps[index].durationSeconds
-                _state.value = State.Running(exercise, index, remaining)
+                var remaining = exercise.steps[index].durationSeconds * 1000L
                 while (remaining > 0) {
-                    val skipped = withTimeoutOrNull(1_000) { skipRequests.receive() } != null
-                    if (skipped) break
-                    remaining--
                     _state.value = State.Running(exercise, index, remaining)
+                    delay(TICK_MS)
+                    remaining -= TICK_MS
                 }
             }
-            val feedback = completeExercise(exercise.id, reminderId)
-            _state.value = State.Finished(feedback)
+            _state.value = State.Finished(completeExercise(exercise.id, reminderId))
         }
     }
 
-    /** Jump to the next step (on the last step this finishes the exercise). */
-    fun skipStep() {
-        if (_state.value is State.Running) skipRequests.trySend(Unit)
-    }
-
-    /** Stop without recording a completion. */
-    fun cancel() {
+    /** Stop without recording a completion; the caller marks the reminder aborted. */
+    fun abort() {
         val current = _state.value
-        if (current is State.Finished || current is State.Cancelled) return
+        if (current is State.Finished || current is State.Aborted) return
         job?.cancel()
         if (current is State.Running) analytics.track(AnalyticsEvent.ExerciseCancelled(atStep = current.stepIndex + 1))
-        _state.value = State.Cancelled
+        _state.value = State.Aborted // the owner records the abort (it outlives this scope)
+    }
+
+    companion object {
+        const val TICK_MS = 100L
     }
 }

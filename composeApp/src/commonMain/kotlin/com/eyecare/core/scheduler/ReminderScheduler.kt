@@ -4,7 +4,11 @@ import com.eyecare.core.analytics.AnalyticsEvent
 import com.eyecare.core.analytics.AnalyticsTracker
 import com.eyecare.core.notification.NotificationManager
 import com.eyecare.core.notification.ReminderEvent
-import com.eyecare.domain.model.NotificationStatus
+import com.eyecare.domain.model.NotificationStatus.MISSED
+import com.eyecare.domain.model.NotificationStatus.SHOWN
+import com.eyecare.domain.model.NotificationStatus.SNOOZED
+import com.eyecare.domain.model.NotificationStatus.STARTED
+import com.eyecare.domain.model.ScheduledNotification
 import com.eyecare.domain.repository.ReminderRepository
 import com.eyecare.domain.repository.ScheduleRepository
 import com.eyecare.domain.time.AppClock
@@ -19,15 +23,24 @@ import java.time.Duration
 import java.time.Instant
 import kotlin.time.Duration.Companion.seconds
 
+/** The upcoming reminder: a regular slot or a snoozed one (then [slotAt] is the original time). */
+data class NextReminder(val at: Instant, val isSnooze: Boolean, val bandId: Long, val slotAt: Instant)
+
+data class SchedulerState(
+    /** A reminder is waiting for the user (toast shown or queued behind an exercise). */
+    val dueNow: Boolean = false,
+    val next: NextReminder? = null,
+)
+
 /**
- * Runs while the app is alive (also when minimised to the tray) and decides when a reminder is due.
- *
- * Instead of one long `delay` it re-evaluates every [tick] and looks at the window since the
- * previous evaluation. This makes it robust to sleep/resume and clock changes:
- * - a slot that became due less than [lateTolerance] ago fires once;
- * - older slots (e.g. the machine was asleep) are dropped, so missed reminders never pile up;
- * - a slot is persisted before it is shown, and only slots after the last persisted one may fire,
- *   so the same occurrence is never shown twice (even across restarts).
+ * Runs while the app is alive (also when only the tray icon is visible) and decides when a reminder
+ * is due. Each evaluation looks at the window since the previous one, which makes it robust to
+ * sleep/resume and clock changes:
+ * - if several occurrences became due at once (e.g. after sleep), only the latest is shown and the
+ *   rest are recorded as missed, so reminders never pile up;
+ * - every occurrence is persisted with its (band, slot) key before it is shown, so the same
+ *   occurrence is never shown twice, even across restarts;
+ * - a newer reminder supersedes one still waiting for an answer (that one becomes missed).
  */
 class ReminderScheduler(
     private val schedules: ScheduleRepository,
@@ -35,20 +48,31 @@ class ReminderScheduler(
     private val notifier: NotificationManager,
     private val clock: AppClock,
     private val analytics: AnalyticsTracker,
-    private val tick: kotlin.time.Duration = 15.seconds,
-    private val lateTolerance: Duration = Duration.ofMinutes(2),
+    private val tick: kotlin.time.Duration = 5.seconds,
 ) {
-    private val _nextTrigger = MutableStateFlow<Instant?>(null)
-    /** Earliest upcoming reminder (regular slot or snooze), for the home screen. */
-    val nextTrigger: StateFlow<Instant?> = _nextTrigger.asStateFlow()
+    private val _state = MutableStateFlow(SchedulerState())
+    val state: StateFlow<SchedulerState> = _state.asStateFlow()
 
     private val wake = Channel<Unit>(Channel.CONFLATED)
     private val mutex = Mutex()
-    private var lastEvaluatedAt: Instant? = null
+    private var lastCheckedAt: Instant? = null
+
+    private sealed interface Candidate {
+        val at: Instant
+        data class Regular(val slot: Slot) : Candidate { override val at get() = slot.at }
+        data class Snoozed(val row: ScheduledNotification) : Candidate { override val at get() = row.nextTriggerAt }
+    }
 
     /** Ask for an immediate re-evaluation (routine saved, reminder snoozed, …). */
     fun refresh() {
         wake.trySend(Unit)
+    }
+
+    /** Reminders left open by a previous run cannot be answered any more. */
+    suspend fun recoverAfterRestart() = mutex.withLock {
+        val now = clock.now()
+        reminders.withStatus(SHOWN, STARTED).forEach { reminders.setStatus(it.id, MISSED) }
+        reminders.withStatus(SNOOZED).filter { it.nextTriggerAt.isBefore(now) }.forEach { reminders.setStatus(it.id, MISSED) }
     }
 
     /** Main loop; cancel the calling coroutine to stop it. */
@@ -62,45 +86,60 @@ class ReminderScheduler(
     suspend fun evaluate() = mutex.withLock {
         val now = clock.now()
         val zone = clock.zone()
-        val routine = schedules.getSchedules()
-        val from = lastEvaluatedAt ?: now
-        lastEvaluatedAt = now
+        val bands = schedules.getBands()
+        val from = lastCheckedAt ?: now
+        lastCheckedAt = now
 
-        var shown = false
-
-        // 1. Regular routine slot that became due since the previous evaluation.
+        val candidates = mutableListOf<Candidate>()
         if (now.isAfter(from)) {
-            val due = NextTriggerCalculator.latestDue(routine, from, now, zone)
-            val lastHandled = reminders.lastHandledSlot()
-            val isNew = due != null && (lastHandled == null || due.at.isAfter(lastHandled))
-            if (due != null && isNew && Duration.between(due.at, now) <= lateTolerance) {
-                reminders.skipAllSnoozed() // a fresh reminder supersedes an older snoozed one
-                val id = reminders.recordFired(due.scheduleId, due.at)
-                show(ReminderEvent(reminderId = id, slotAt = due.at, isSnoozeRepeat = false))
-                shown = true
-            }
+            NextTriggerCalculator.slotsBetween(bands, from, now, zone)
+                .filter { reminders.find(it.bandId, it.at) == null }
+                .forEach { candidates += Candidate.Regular(it) }
         }
+        reminders.withStatus(SNOOZED).filter { !it.nextTriggerAt.isAfter(now) }.forEach { candidates += Candidate.Snoozed(it) }
 
-        // 2. Snoozed reminder whose time has come.
-        val snooze = reminders.activeSnooze()
-        if (snooze != null && !snooze.nextTriggerAt.isAfter(now)) {
-            val late = Duration.between(snooze.nextTriggerAt, now) > lateTolerance
-            if (shown || late) {
-                reminders.setStatus(snooze.id, NotificationStatus.SKIPPED)
-            } else {
-                reminders.setStatus(snooze.id, NotificationStatus.FIRED)
-                show(ReminderEvent(reminderId = snooze.id, slotAt = snooze.slotAt, isSnoozeRepeat = true))
+        if (candidates.isNotEmpty()) {
+            candidates.sortBy { it.at }
+            val latest = candidates.removeAt(candidates.lastIndex)
+            candidates.forEach { c ->
+                when (c) {
+                    is Candidate.Regular -> reminders.record(c.slot.bandId, c.slot.at, MISSED)
+                    is Candidate.Snoozed -> reminders.setStatus(c.row.id, MISSED)
+                }
             }
+            fire(latest)
         }
-
-        // 3. Publish the next upcoming moment.
-        val nextRegular = NextTriggerCalculator.next(routine, now, zone)?.at
-        val nextSnooze = reminders.activeSnooze()?.nextTriggerAt
-        _nextTrigger.value = listOfNotNull(nextRegular, nextSnooze).minOrNull()
+        publish(now)
     }
 
-    private fun show(event: ReminderEvent) {
+    private suspend fun fire(candidate: Candidate) {
+        val pending = reminders.withStatus(SHOWN)
+        val event = when (candidate) {
+            is Candidate.Regular -> {
+                val id = reminders.record(candidate.slot.bandId, candidate.slot.at, SHOWN)
+                ReminderEvent(id, candidate.slot.bandId, candidate.slot.at, isSnoozeRepeat = false)
+            }
+            is Candidate.Snoozed -> {
+                reminders.setStatus(candidate.row.id, SHOWN)
+                ReminderEvent(candidate.row.id, candidate.row.bandId, candidate.row.slotAt, isSnoozeRepeat = true)
+            }
+        }
+        pending.filter { it.id != event.reminderId }.forEach { reminders.setStatus(it.id, MISSED) }
         notifier.showReminder(event)
         analytics.track(AnalyticsEvent.ReminderShown)
+    }
+
+    private suspend fun publish(now: Instant) {
+        val zone = clock.zone()
+        val bands = schedules.getBands()
+        val handled = reminders.getSince(now.minus(Duration.ofDays(1))).map { it.bandId to it.slotAt }.toSet()
+        val regular = NextTriggerCalculator.next(bands, now, zone, handled)
+            ?.let { NextReminder(it.at, isSnooze = false, bandId = it.bandId, slotAt = it.at) }
+        val snooze = reminders.withStatus(SNOOZED).minByOrNull { it.nextTriggerAt }
+            ?.let { NextReminder(it.nextTriggerAt, isSnooze = true, bandId = it.bandId, slotAt = it.slotAt) }
+        _state.value = SchedulerState(
+            dueNow = reminders.withStatus(SHOWN).isNotEmpty(),
+            next = listOfNotNull(regular, snooze).minByOrNull { it.at },
+        )
     }
 }

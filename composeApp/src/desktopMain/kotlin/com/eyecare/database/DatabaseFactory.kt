@@ -13,6 +13,7 @@ object DatabaseFactory {
         return Room.databaseBuilder<AppDatabase>(name = file.absolutePath)
             .setDriver(BundledSQLiteDriver())
             .setQueryCoroutineContext(Dispatchers.IO)
+            .fallbackToDestructiveMigrationFrom(true, AppDatabase.UNRELEASED_VERSION)
             .build()
     }
 }

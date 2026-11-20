@@ -2,7 +2,6 @@ package com.eyecare.data.database
 
 import androidx.room.Dao
 import androidx.room.Insert
-import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Transaction
 import androidx.room.Upsert
@@ -21,51 +20,45 @@ interface SettingsDao {
 }
 
 @Dao
-interface ScheduleDao {
-    @Query("SELECT * FROM weekly_schedule ORDER BY dayOfWeek, startMinute")
-    fun observeAll(): Flow<List<WeeklyScheduleEntity>>
+interface TimeBandDao {
+    @Query("SELECT * FROM time_band ORDER BY id")
+    fun observeAll(): Flow<List<TimeBandEntity>>
 
-    @Query("SELECT * FROM weekly_schedule ORDER BY dayOfWeek, startMinute")
-    suspend fun getAll(): List<WeeklyScheduleEntity>
+    @Query("SELECT * FROM time_band ORDER BY id")
+    suspend fun getAll(): List<TimeBandEntity>
 
-    @Query("SELECT COUNT(*) FROM weekly_schedule")
-    suspend fun count(): Int
+    @Upsert
+    suspend fun upsert(band: TimeBandEntity): Long
 
-    @Query("DELETE FROM weekly_schedule")
-    suspend fun deleteAll()
-
-    @Insert
-    suspend fun insertAll(items: List<WeeklyScheduleEntity>)
-
-    @Transaction
-    suspend fun replaceAll(items: List<WeeklyScheduleEntity>) {
-        deleteAll()
-        insertAll(items)
-    }
+    @Query("DELETE FROM time_band WHERE id = :id")
+    suspend fun delete(id: Long)
 }
 
 @Dao
 interface NotificationDao {
+    @Query("SELECT * FROM scheduled_notification WHERE slotAt >= :since OR status = 'SNOOZED' ORDER BY slotAt")
+    fun observeSince(since: Long): Flow<List<ScheduledNotificationEntity>>
+
+    @Query("SELECT * FROM scheduled_notification WHERE slotAt >= :since OR status = 'SNOOZED' ORDER BY slotAt")
+    suspend fun getSince(since: Long): List<ScheduledNotificationEntity>
+
+    @Query("SELECT * FROM scheduled_notification WHERE bandId = :bandId AND slotAt = :slotAt")
+    suspend fun find(bandId: Long, slotAt: Long): ScheduledNotificationEntity?
+
     @Insert
     suspend fun insert(item: ScheduledNotificationEntity): Long
 
-    @Query("SELECT MAX(slotAt) FROM scheduled_notification")
-    suspend fun maxSlotAt(): Long?
-
-    @Query("SELECT * FROM scheduled_notification WHERE status = 'SNOOZED' ORDER BY nextTriggerAt LIMIT 1")
-    suspend fun activeSnooze(): ScheduledNotificationEntity?
-
-    @Query("SELECT * FROM scheduled_notification WHERE status = 'SNOOZED' ORDER BY nextTriggerAt LIMIT 1")
-    fun observeActiveSnooze(): Flow<ScheduledNotificationEntity?>
-
-    @Query("UPDATE scheduled_notification SET status = 'SNOOZED', nextTriggerAt = :until WHERE id = :id")
-    suspend fun snooze(id: Long, until: Long)
+    @Query("SELECT * FROM scheduled_notification WHERE status IN (:statuses) ORDER BY nextTriggerAt")
+    suspend fun withStatus(statuses: List<String>): List<ScheduledNotificationEntity>
 
     @Query("UPDATE scheduled_notification SET status = :status WHERE id = :id")
     suspend fun setStatus(id: Long, status: String)
 
-    @Query("UPDATE scheduled_notification SET status = 'SKIPPED' WHERE status = 'SNOOZED'")
-    suspend fun skipAllSnoozed()
+    @Query("UPDATE scheduled_notification SET status = 'SNOOZED', wasSnoozed = 1, nextTriggerAt = :until WHERE id = :id")
+    suspend fun snooze(id: Long, until: Long)
+
+    @Query("DELETE FROM scheduled_notification WHERE id = :id")
+    suspend fun delete(id: Long)
 }
 
 @Dao
@@ -73,10 +66,6 @@ interface ExerciseDao {
     @Transaction
     @Query("SELECT * FROM exercise ORDER BY id LIMIT 1")
     suspend fun getFirst(): ExerciseWithSteps?
-
-    @Transaction
-    @Query("SELECT * FROM exercise WHERE id = :id")
-    suspend fun getById(id: Long): ExerciseWithSteps?
 
     @Query("SELECT COUNT(*) FROM exercise")
     suspend fun count(): Int
@@ -94,12 +83,12 @@ interface ExerciseDao {
         return id
     }
 
-    @Insert(onConflict = OnConflictStrategy.ABORT)
+    @Insert
     suspend fun insertCompletion(completion: ExerciseCompletionEntity)
 
-    @Query("SELECT * FROM exercise_completion ORDER BY completedAt")
-    fun observeCompletions(): Flow<List<ExerciseCompletionEntity>>
+    @Query("SELECT * FROM exercise_completion WHERE completedAt >= :since ORDER BY completedAt")
+    fun observeCompletionsSince(since: Long): Flow<List<ExerciseCompletionEntity>>
 
-    @Query("SELECT * FROM exercise_completion ORDER BY completedAt")
-    suspend fun getCompletions(): List<ExerciseCompletionEntity>
+    @Query("SELECT * FROM exercise_completion WHERE completedAt >= :since ORDER BY completedAt")
+    suspend fun getCompletionsSince(since: Long): List<ExerciseCompletionEntity>
 }

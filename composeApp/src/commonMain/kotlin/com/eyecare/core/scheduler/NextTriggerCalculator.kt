@@ -1,59 +1,67 @@
 package com.eyecare.core.scheduler
 
-import com.eyecare.domain.model.WeeklySchedule
-import java.time.Duration
+import com.eyecare.domain.model.TimeBand
 import java.time.Instant
 import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.LocalTime
 import java.time.ZoneId
 import java.time.ZonedDateTime
 
-/** A concrete reminder moment produced by a weekly routine entry. */
-data class Slot(val scheduleId: Long, val at: Instant)
+/** A concrete reminder moment of a band. */
+data class Slot(val bandId: Long, val at: Instant)
+
+/** One occurrence of a band on a given day: its window and the reminder slots inside it. */
+data class BandInstance(val band: TimeBand, val start: Instant, val end: Instant, val slots: List<Slot>) {
+    operator fun contains(t: Instant) = !t.isBefore(start) && t.isBefore(end)
+}
 
 /**
- * Pure weekly-recurrence logic (US-13). Slots are `start + k * interval` while `< end`, on the
- * routine's day of week, in local time. They are built through [ZonedDateTime] so DST changes
- * shift wall-clock times correctly: a slot inside the spring-forward gap moves to the first valid
- * time, and an ambiguous fall-back time is only produced once.
+ * Pure weekly-recurrence logic (US-13). Slots are `start + k * interval` while inside the band,
+ * computed on local wall-clock time and converted through [ZonedDateTime], so DST changes keep
+ * reminders at the same clock time (a time in the spring-forward gap moves to the next valid one,
+ * duplicates are removed).
  */
 object NextTriggerCalculator {
 
-    private val MAX_RANGE: Duration = Duration.ofDays(8)
-
-    /** First slot strictly after [after], looking at most a week ahead; null when no routine is active. */
-    fun next(schedules: List<WeeklySchedule>, after: Instant, zone: ZoneId): Slot? =
-        slotsBetween(schedules, after, after.plus(MAX_RANGE), zone).firstOrNull()
-
-    /** Most recent slot in the half-open window (from, to]; used to detect a slot that just became due. */
-    fun latestDue(schedules: List<WeeklySchedule>, from: Instant, to: Instant, zone: ZoneId): Slot? {
-        val start = maxOf(from, to.minus(MAX_RANGE))
-        return slotsBetween(schedules, start, to.plusMillis(1), zone).lastOrNull()
-    }
-
-    /** All slots in (from, toExclusive), sorted and de-duplicated by instant. */
-    fun slotsBetween(schedules: List<WeeklySchedule>, from: Instant, toExclusive: Instant, zone: ZoneId): List<Slot> {
-        val active = schedules.filter { it.enabled && it.intervalMinutes > 0 && it.startTime < it.endTime }
-        if (active.isEmpty() || !from.isBefore(toExclusive)) return emptyList()
-
-        val firstDate = from.atZone(zone).toLocalDate().minusDays(1)
-        val lastDate = toExclusive.atZone(zone).toLocalDate()
-        val result = mutableListOf<Slot>()
-
-        var date: LocalDate = firstDate
-        while (!date.isAfter(lastDate)) {
-            for (schedule in active) {
-                if (schedule.dayOfWeek != date.dayOfWeek) continue
-                val startMinute = schedule.startTime.hour * 60 + schedule.startTime.minute
-                val endMinute = schedule.endTime.hour * 60 + schedule.endTime.minute
-                var minute = startMinute
-                while (minute < endMinute) {
-                    val at = ZonedDateTime.of(date, java.time.LocalTime.of(minute / 60, minute % 60), zone).toInstant()
-                    if (at.isAfter(from) && at.isBefore(toExclusive)) result += Slot(schedule.id, at)
-                    minute += schedule.intervalMinutes
-                }
+    /** Band instances that start on any day from [fromDate] to [toDate] (inclusive). */
+    fun instances(bands: List<TimeBand>, fromDate: LocalDate, toDate: LocalDate, zone: ZoneId): List<BandInstance> {
+        val result = mutableListOf<BandInstance>()
+        var date = fromDate
+        while (!date.isAfter(toDate)) {
+            for (band in bands) {
+                if (!band.active || date.dayOfWeek !in band.days || band.intervalMinutes <= 0) continue
+                val startLocal = LocalDateTime.of(date, LocalTime.MIDNIGHT).plusMinutes(band.startMinute.toLong())
+                val endLocal = startLocal.plusMinutes(band.durationMinutes.toLong())
+                val slots = (0 until band.reminderCount)
+                    .map { k -> Slot(band.id, startLocal.plusMinutes(k.toLong() * band.intervalMinutes).atZone(zone).toInstant()) }
+                    .distinctBy { it.at }
+                result += BandInstance(band, startLocal.atZone(zone).toInstant(), endLocal.atZone(zone).toInstant(), slots)
             }
             date = date.plusDays(1)
         }
-        return result.sortedBy { it.at }.distinctBy { it.at }
+        return result.sortedBy { it.start }
+    }
+
+    /** All slots in the half-open interval (from, to], sorted. */
+    fun slotsBetween(bands: List<TimeBand>, from: Instant, to: Instant, zone: ZoneId): List<Slot> {
+        if (!from.isBefore(to)) return emptyList()
+        val first = from.atZone(zone).toLocalDate().minusDays(1)
+        val last = to.atZone(zone).toLocalDate()
+        return instances(bands, first, last, zone).flatMap { it.slots }
+            .filter { it.at.isAfter(from) && !it.at.isAfter(to) }
+            .sortedBy { it.at }
+            .distinctBy { it.bandId to it.at }
+    }
+
+    /** First slot strictly after [after], looking at most 8 days ahead, not in [handled]. */
+    fun next(bands: List<TimeBand>, after: Instant, zone: ZoneId, handled: Set<Pair<Long, Instant>> = emptySet()): Slot? =
+        slotsBetween(bands, after, after.plusSeconds(8L * 86_400), zone).firstOrNull { (it.bandId to it.at) !in handled }
+
+    /** The instance running at [now], otherwise the next one to start (within a week). */
+    fun currentOrNextInstance(bands: List<TimeBand>, now: Instant, zone: ZoneId): BandInstance? {
+        val today = now.atZone(zone).toLocalDate()
+        val list = instances(bands, today.minusDays(1), today.plusDays(8), zone)
+        return list.firstOrNull { now in it } ?: list.firstOrNull { it.start.isAfter(now) }
     }
 }

@@ -10,34 +10,35 @@ import androidx.room.Relation
 @Entity(tableName = "user_settings")
 data class UserSettingsEntity(
     @PrimaryKey val id: Int = SINGLETON_ID,
-    val theme: String,
     val snoozeMinutes: Int,
+    val setupAt: Long?,
 ) {
     companion object { const val SINGLETON_ID = 1 }
 }
 
-/** dayOfWeek: ISO 1 (Monday) … 7 (Sunday); times as minutes of day in local time. */
-@Entity(tableName = "weekly_schedule")
-data class WeeklyScheduleEntity(
+/** daysMask: bit (dayOfWeek - 1), Monday = bit 0; minutes are local minutes of day. */
+@Entity(tableName = "time_band")
+data class TimeBandEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
-    val dayOfWeek: Int,
+    val daysMask: Int,
     val startMinute: Int,
     val endMinute: Int,
     val intervalMinutes: Int,
-    val enabled: Boolean,
+    val active: Boolean,
 )
 
-/** Instants as epoch milliseconds (UTC); converted to local time only when calculating/displaying. */
+/** Instants as epoch milliseconds (UTC). One row per routine occurrence that was handled. */
 @Entity(
     tableName = "scheduled_notification",
-    indices = [Index("status"), Index("slotAt")],
+    indices = [Index(value = ["bandId", "slotAt"], unique = true), Index("status"), Index("slotAt")],
 )
 data class ScheduledNotificationEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
-    val scheduleId: Long?,
+    val bandId: Long,
     val slotAt: Long,
     val nextTriggerAt: Long,
     val status: String,
+    val wasSnoozed: Boolean,
 )
 
 @Entity(tableName = "exercise")
@@ -49,39 +50,28 @@ data class ExerciseEntity(
 
 @Entity(
     tableName = "exercise_step",
-    foreignKeys = [
-        ForeignKey(
-            entity = ExerciseEntity::class,
-            parentColumns = ["id"],
-            childColumns = ["exerciseId"],
-            onDelete = ForeignKey.CASCADE,
-        ),
-    ],
+    foreignKeys = [ForeignKey(ExerciseEntity::class, ["id"], ["exerciseId"], onDelete = ForeignKey.CASCADE)],
     indices = [Index("exerciseId")],
 )
 data class ExerciseStepEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val exerciseId: Long,
+    val title: String,
     val instruction: String,
     val durationSeconds: Int,
     val stepOrder: Int,
+    val art: String,
 )
 
 @Entity(
     tableName = "exercise_completion",
-    foreignKeys = [
-        ForeignKey(
-            entity = ExerciseEntity::class,
-            parentColumns = ["id"],
-            childColumns = ["exerciseId"],
-            onDelete = ForeignKey.CASCADE,
-        ),
-    ],
+    foreignKeys = [ForeignKey(ExerciseEntity::class, ["id"], ["exerciseId"], onDelete = ForeignKey.CASCADE)],
     indices = [Index("exerciseId"), Index("completedAt")],
 )
 data class ExerciseCompletionEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val exerciseId: Long,
+    val reminderId: Long?,
     val completedAt: Long,
 )
 
